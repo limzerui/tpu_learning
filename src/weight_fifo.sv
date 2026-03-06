@@ -152,7 +152,114 @@ module weight_fifo #(
         end
     end
 
-    //
+
+    //what are the exact steps to load one 32 bit word from SRAM into the bffer
+    //one word-> 4 weights where each weight is 8 bits
+    //repeat it 16 times track position with pf_row and pf_col
+    //pf is pre fetch
+
+    always @(posedge clk) begin
+        if (reset) begin
+           pf_state <= PF_IDLE;
+           pf_addr <= 14'd0;
+           pf_word_count <= 6'd0;
+           pf_total_words <= 6'd0;
+           pf_target_buffer <= 1'b0;
+           pf_row <= 3'b0;
+           pf_col <= 3'b0; 
+           mem_req <= 1'b0;
+           mem_addr <= 14'd0;
+        end else begin
+            case (pf_state)
+                PF_IDLE: begin
+                   mem_req <= 1'b0;
+                   if (prefetch_start) begin
+                        pf_addr <= prefetch_base_addr;
+                        //each row needs N/4 words
+                        pf_total_words <= prefetch_rows * (N/4);
+                        pf_word_count <= 6'd0;
+                        pf_row <= 3'b0;
+                        pf_col <= 3'b0;
+                        //set target buffer to the inactive buffer
+                        pf_target_buffer <= ~active_buf;
+                        pf_state <= PF_REQUEST;
+                   end
+                end
+                PF_REQUEST: begin
+                    mem_req <= 1'b1;
+                    mem_addr <= pf_addr;
+                    pf_state <= PF_WAIT;
+                end
+                PF_WAIT: begin
+                    mem_req <= 1'b0;
+                    if (mem_grant) begin
+                        pf_state <= PF_STORE;
+                    end
+                end
+                PF_STORE: begin
+                    //mem_rdata is 32 bits with 4 INT8 weights packed int 32 bits -> we need to unpack
+                    if (pf_target_buffer == 0) begin
+                        buffer_a[pf_row][pf_col] <= mem_rdata[7:0];
+                        buffer_a[pf_row][pf_col+1] <= mem_rdata[15:8];
+                        buffer_a[pf_row][pf_col+2] <= mem_rdata[23:16];
+                        buffer_a[pf_row][pf_col+3] <= mem_rdata[31:24];
+                    end else begin
+                        buffer_b[pf_row][pf_col] <= mem_rdata[7:0];
+                        buffer_b[pf_row][pf_col+1] <= mem_rdata[15:8];
+                        buffer_b[pf_row][pf_col+2] <= mem_rdata[23:16];
+                        buffer_b[pf_row][pf_col+3] <= mem_rdata[31:24];
+                    end
+                    //advance the address counter
+                    pf_addr <= pf_addr + 1'b1;
+                    pf_word_count <= pf_word_count + 1'b1;
+                    
+                    //advance position-> col steps 0->4->0
+                    if (pf_col + 4>= N) begin
+                        pf_col <= 3'b0;
+                        pf_row <= pf_row + 1'b1;
+                    end else begin
+                        pf_col <= pf_col + 4;
+                    end
+
+                    //check if done with all words
+                    if (pf_word_count + 1 >= pf_total_words) begin
+                        pf_state <= PF_DONE;
+                    end else begin
+                        pf_state <= PF_REQUEST; //fetch next round of word
+                    end
+                end
+                PF_DONE: begin
+                    //mark the buffer we just filled as valid
+                    //drain logic will see this and allow swap on next tile end
+                    if (pf_target_buffer == 0) begin
+                        buffer_a_valid <= 1'b1;
+                        words_in_a <= pf_total_words;
+                    end else begin
+                        buffer_b_valid <= 1'b1;
+                        words_in_b <= pf_total_words;
+                    end
+                    pf_state <= PF_IDLE; //ready for next prefetch
+                end
+                default: begin
+                    pf_state <= PF_IDLE;
+                end
+            endcase            
+        end
+    end
+
+    //simulation init - zero all weights to avoid X propogation in sim
+    integer r,c;
+    initial begin
+        for (r = 0; r < N; r = r + 1) begin
+            for (c = 0; c < N; c = c + 1) begin
+                buffer_a[r][c] = 8'b0;
+                buffer_b[r][c] = 8'b0;
+            end
+        end
+    end
+
+
+
 
 
 
@@ -161,3 +268,5 @@ module weight_fifo #(
     
 
 
+
+endmodule

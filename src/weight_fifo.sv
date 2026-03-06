@@ -1,17 +1,20 @@
-//weight fifo, double buffered weight staging
-//needs weights loaded before computing
-//lioading fform sram and computing cant overlap in single buffer
-//two buffers, A drains into systolic array
-//BB is filled from SRAm. when A is empty, instantly swap
+`default_nettype none
+`timescale 1ns/1ns
 
-//independent processes running in parallel, 
-    //prefetch fsm: reads from unified buffer-> fills the inactive buffer
-    //drain, sends rows from aactive buffer to systolic array
+// WEIGHT FIFO — Double-Buffered Weight Staging
+//
+// PROBLEM: Loading weights from SRAM and computing cannot overlap in a single buffer.
+// SOLUTION: Two buffers. While Buffer A drains into the systolic array,
+//           Buffer B is being prefetched from SRAM. When A is empty, swap instantly.
+//
+// TWO INDEPENDENT PROCESSES running in parallel:
+//   PREFETCH FSM : reads from unified buffer → fills the inactive buffer
+//   DRAIN LOGIC  : sends rows from the active buffer → systolic array row by row
 
 module weight_fifo #(
-    parameter N = 8; //systolic array dimension
-    parameter DATA_WIDTH = 8 //INT8 weights
-    parameter BUFFER_DEPTH = 64 //NxN weights
+    parameter N            = 8,   // Systolic array dimension (NxN PEs)
+    parameter DATA_WIDTH   = 8,   // INT8 weights
+    parameter BUFFER_DEPTH = 64   // N×N = 64 weights per buffer
 )(
     input wire clk,
     input wire reset,
@@ -55,14 +58,14 @@ module weight_fifo #(
     reg signed [DATA_WIDTH-1:0] buffer_a [0:N-1][0:N-1];
     reg signed [DATA_WIDTH-1:0] buffer_b [0:N-1][0:N-1];
 
-    //buffer control state
-    reg active_buf //0= sys array reads from A, else B
-    reg [2:0] drain_row //which row currently outputting from the buffer
+    // Buffer control state
+    reg        active_buf;      // 0 = systolic array reads from A, 1 = from B
+    reg [2:0]  drain_row;       // Which row is currently being output (0 to N-1)
 
-    reg buffer_a_valid //A contains fully loaded tile
-    reg buffer_b_valid //B contains fully loaded tile
-    reg [5:0] words_in_a //words loaded into A
-    reg [5:0] words_in_b //words loaded into B
+    reg        buffer_a_valid;  // Buffer A contains a fully loaded tile
+    reg        buffer_b_valid;  // Buffer B contains a fully loaded tile
+    reg [5:0]  words_in_a;      // Number of 32-bit words loaded into Buffer A (debug)
+    reg [5:0]  words_in_b;      // Number of 32-bit words loaded into Buffer B (debug)
 
     //pre fetch fsm state
     //5 state because one mem read takes multiple cycles
@@ -82,8 +85,8 @@ module weight_fifo #(
     //position tracking within the buffer being filled:
     //each 32 bit fills 4 consecutive columns on one row
     //pf_col advances by 4 per word; when it wraps, pf_row increments
-    reg [2:0] pf_row;
-    reg [2:0] pf_col; //0,4,8,12,16,20,24,28
+    reg [2:0]  pf_row;  // Row currently being filled (0 to N-1)
+    reg [3:0]  pf_col;  // Column offset within that row: 0 then 4 (2 words per row for N=8)
 
     //combinational outputs
     //what do i need to comput wihtout a state machine
@@ -166,7 +169,7 @@ module weight_fifo #(
            pf_total_words <= 6'd0;
            pf_target_buffer <= 1'b0;
            pf_row <= 3'b0;
-           pf_col <= 3'b0; 
+           pf_col <= 4'd0;  // 4 bits wide to match [3:0] declaration
            mem_req <= 1'b0;
            mem_addr <= 14'd0;
         end else begin
@@ -179,7 +182,7 @@ module weight_fifo #(
                         pf_total_words <= prefetch_rows * (N/4);
                         pf_word_count <= 6'd0;
                         pf_row <= 3'b0;
-                        pf_col <= 3'b0;
+                        pf_col <= 4'd0;
                         //set target buffer to the inactive buffer
                         pf_target_buffer <= ~active_buf;
                         pf_state <= PF_REQUEST;
@@ -192,7 +195,8 @@ module weight_fifo #(
                 end
                 PF_WAIT: begin
                     mem_req <= 1'b0;
-                    if (mem_grant) begin
+                    // mem_valid IS the declared port — memory controller pulses it when data arrives
+                    if (mem_valid) begin
                         pf_state <= PF_STORE;
                     end
                 end
@@ -257,16 +261,5 @@ module weight_fifo #(
             end
         end
     end
-
-
-
-
-
-
-
-
-    
-
-
 
 endmodule

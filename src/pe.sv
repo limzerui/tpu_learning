@@ -4,63 +4,82 @@
 // =============================================================================
 // PROCESSING ELEMENT (PE)
 // =============================================================================
-// The PE is the atomic compute unit in the systolic array.
-// 64 of these form an 8×8 grid and together compute one matrix multiply tile.
+// The PE is the ATOMIC COMPUTE UNIT of the TPU. 64 of these (in an 8×8 grid)
+// compute one matrix-multiply tile together.
 //
-// DATAFLOW — Weight-Stationary:
-//   - Weights are loaded ONCE and held in weight_reg for the entire computation
-//   - Activations stream IN from the west, MAC, then pass OUT to the east
-//   - Partial sums accumulate flowing from north to south
+// KEY CONCEPT — Weight-Stationary Dataflow:
+//   Instead of moving weights each cycle, we load them into the PE ONCE and
+//   hold them fixed ("stationary") for the entire computation. Then we stream
+//   activations through and let partial sums flow downward and accumulate.
+//
+//   Think of each PE as a tiny MAC (Multiply-Accumulate) unit that "remembers"
+//   one weight and keeps adding (activation × weight) to a running total.
 //
 // DATA DIRECTIONS:
-//   West  → East  : activation data passes through (8-bit, 1 cycle delay)
-//   North → South : partial sums accumulate downward (32-bit)
-//   West input    : also used to receive weight during weight_load phase
+//   ┌───────────────────────────────────┐
+//   │        psum_in_north (INT32)      │  ← partial sum flowing IN from PE above
+//   │               │                  │
+//   │   data_in_west (INT8) ──→──[×]──→ data_out_east      │  ← activation passes east
+//   │                          │        │
+//   │                         [+]       │
+//   │                          │        │
+//   │        psum_out_south (INT32)     │  → partial sum flowing OUT to PE below
+//   └───────────────────────────────────┘
 //
 // TWO OPERATING MODES:
-//   1. weight_load = 1  →  Store data_in_west into weight_reg (no MAC)
-//   2. weight_load = 0  →  MAC: psum_out = psum_in + (activation × weight)
+//   1. weight_load = 1  →  Latch data_in_west into weight_reg. No computation.
+//   2. weight_load = 0  →  Compute: psum_out = psum_in + (data_in_west × weight_reg)
 //
-// TIMING (1-cycle registered pipeline):
-//   - All outputs register on posedge clk
-//   - 1-cycle latency through each PE — this creates the systolic wavefront
+// TIMING — 1-cycle registered pipeline:
+//   All outputs are registered on posedge clk. This 1-cycle delay through each PE
+//   is what creates the "systolic wavefront" — activations arrive at PE[row][col]
+//   exactly col cycles after entering the left edge of the array.
+//
+// WORD ON `clear_acc`:
+//   There are TWO "accumulations" happening here:
+//   a) `psum_out_south`: a PIPELINE register that passes partial sums south each cycle.
+//      This is NOT the final result—it's a relay.
+//   b) `accumulator` : a STICKY register that accumulates the local dot-product over time.
+//      This is used for output-stationary mode or direct result readout.
+//   `clear_acc` resets only the sticky `accumulator`, not the psum pipeline.
 // =============================================================================
 
 module pe #(
     parameter DATA_WIDTH = 8,   // Operand width: INT8 (matches Google TPU v1)
-    parameter ACC_WIDTH  = 32   // Accumulator width: INT32 prevents overflow
-                                // (up to 8 INT8×INT8 products accumulate per column)
+    parameter ACC_WIDTH  = 32   // Accumulator width: INT32 prevents overflow.
+                                // Worst case: 8 × (127 × 127) = 128,898 — fits easily in INT32.
 ) (
     input wire clk,
-    input wire reset,   // Synchronous active-high reset
-    input wire enable,  // When low, PE freezes all outputs (used during weight load of OTHER rows)
+    input wire reset,   // Synchronous, active-high reset
+    input wire enable,  // When low: PE freezes outputs. Used when OTHER rows are loading weights.
 
-    // --- Control Signals ---
-    input wire weight_load, // 1 = store data_in_west as new weight; 0 = compute mode
-    input wire clear_acc,   // 1 = reset local accumulator (start of new tile); 0 = keep accumulating
+    // --- Control ---
+    input wire weight_load, // 1 = latch data_in_west as new weight; 0 = compute mode
+    input wire clear_acc,   // 1 = reset sticky accumulator (start of new tile)
 
     // --- Data Inputs ---
-    // data_in_west: dual-purpose
-    //   - During weight_load: carries the weight value to store
-    //   - During compute   : carries the activation to multiply
+    // data_in_west is DUAL PURPOSE:
+    //   During weight_load → carries the weight value to be stored
+    //   During compute    → carries the activation to be multiplied
     input wire signed [DATA_WIDTH-1:0] data_in_west,
 
     // psum_in_north: partial sum flowing in from the PE directly above.
-    // Row 0 receives 0 (no PE above it — injected at the array boundary).
+    // Row 0 receives 32'sd0 (injected at the array top boundary — no PE above it).
     input wire signed [ACC_WIDTH-1:0] psum_in_north,
 
     // --- Data Outputs ---
-    // data_out_east: activation forwarded to the PE to the right.
-    // Registered (1 cycle delay) — this delay is what creates the systolic wavefront.
+    // data_out_east: activation forwarded to the PE on the right.
+    // CRITICAL: registered (1-cycle delay). This delay staggers activations diagonally,
+    // which is what makes the systolic array work correctly.
     output reg signed [DATA_WIDTH-1:0] data_out_east,
 
-    // psum_out_south: accumulated partial sum passed down to the PE below.
-    // Last row's psum_out_south is the final dot-product result for that column.
+    // psum_out_south: accumulated partial sum passed DOWN to the PE below.
+    // The last row's psum_out_south is the final dot-product result for that column.
     output reg signed [ACC_WIDTH-1:0] psum_out_south,
 
-    // --- Debug Outputs (combinational, no registers) ---
-    output wire signed [DATA_WIDTH-1:0] weight_debug, // Live view of weight_reg
-    output wire signed [ACC_WIDTH-1:0]  acc_debug     // Live view of accumulator
+    // --- Debug Outputs (purely combinational — no delay, no registers) ---
+    output wire signed [DATA_WIDTH-1:0] weight_debug, // Directly exposes weight_reg
+    output wire signed [ACC_WIDTH-1:0]  acc_debug     // Directly exposes accumulator
 );
 
     // -------------------------------------------------------------------------
@@ -68,32 +87,31 @@ module pe #(
     // -------------------------------------------------------------------------
 
     // Holds the stationary weight for the duration of a tile computation.
-    // Written once during weight_load phase, read every cycle during compute.
+    // Written once during weight_load phase. Read every cycle during compute.
     reg signed [DATA_WIDTH-1:0] weight_reg;
 
-    // Local accumulator — tracks the running dot-product for this PE.
-    // Note: this is SEPARATE from psum_out_south (see explanation below).
+    // Local sticky accumulator — stores the running dot-product FOR THIS PE.
+    // NOTE: This is different from psum_out_south. See module header for explanation.
     reg signed [ACC_WIDTH-1:0] accumulator;
 
     // -------------------------------------------------------------------------
-    // Combinational Multiply
+    // Combinational — Multiply
+    // INT8 × INT8 = 16-bit product. 2×DATA_WIDTH avoids overflow.
+    // SystemVerilog handles sign extension automatically when both operands are `signed`.
     // -------------------------------------------------------------------------
-
-    // INT8 × INT8 = 16-bit product. We use 2×DATA_WIDTH to hold it without overflow.
-    // SystemVerilog automatically sign-extends because both operands are 'signed'.
     wire signed [2*DATA_WIDTH-1:0] mult_result;
     assign mult_result = data_in_west * weight_reg;
 
-    // Wire debug ports directly to internal registers (no extra logic)
+    // Debug ports wire directly to internal registers (zero latency, no logic)
     assign weight_debug = weight_reg;
     assign acc_debug    = accumulator;
 
     // -------------------------------------------------------------------------
-    // Sequential Logic — Registered on every posedge clk
+    // Sequential Logic
     // -------------------------------------------------------------------------
     always @(posedge clk) begin
         if (reset) begin
-            // Clear everything to known zero state
+            // All outputs → 0. Using replication syntax {N{bit}} is idiomatic RTL.
             weight_reg     <= {DATA_WIDTH{1'b0}};
             accumulator    <= {ACC_WIDTH{1'b0}};
             data_out_east  <= {DATA_WIDTH{1'b0}};
@@ -102,60 +120,53 @@ module pe #(
         end else if (enable) begin
 
             if (weight_load) begin
-                // -------------------------------------------------------
-                // MODE 1: WEIGHT LOADING
-                // -------------------------------------------------------
-                // The matrix controller is broadcasting weights into the array.
-                // data_in_west carries the weight for THIS PE's column.
-                // We latch it and stop computation for this cycle.
+                // ==============================================================
+                // MODE 1 — WEIGHT LOADING
+                // ==============================================================
+                // The weight_fifo is broadcasting a row of weights into the array.
+                // Only THIS PE's row has weight_load asserted; other rows' PEs are disabled.
+                // We capture the weight and freeze computation this cycle.
                 weight_reg <= data_in_west;
 
-                // Zero out east output — we don't want garbage activations
-                // propagating east while weights are being loaded
+                // Zero east output so garbage doesn't propagate east while weights load.
                 data_out_east <= {DATA_WIDTH{1'b0}};
 
-                // Still pass psum through so the chain isn't broken
+                // Still relay psum south so the pipeline chain isn't broken.
                 psum_out_south <= psum_in_north;
 
             end else begin
-                // -------------------------------------------------------
-                // MODE 2: COMPUTE (MAC) MULTIPLY and ACCUMULATE
-                // -------------------------------------------------------
+                // ==============================================================
+                // MODE 2 — COMPUTE (MAC)
+                // ==============================================================
 
-                // STEP 1: Forward activation east (the systolic pass-through).
-                // The 1-cycle register delay here is CRITICAL — it's what
-                // staggers activations diagonally across the array.
-                // Without it, all PEs would see the same activation simultaneously
-                // and you'd get incorrect results.
-                data_out_east <= data_in_west;
+                // STEP 1: Forward activation east.
+                // The 1-cycle register delay IS intentional and CRITICAL.
+                // It ensures that PE[row][col] sees the activation 'col' cycles after
+                // it enters the left edge — this creates the diagonal wavefront.
+                data_out_east  <= data_in_west;
 
-                // STEP 2: MAC — accumulate into the partial sum chain.
-                // psum_out_south = (psum from PE above) + (my activation × my weight)
-                // This builds up a column dot-product as data flows south.
+                // STEP 2: MAC — add (activation × weight) to the incoming partial sum.
+                // This builds up a column's dot product as data flows from north → south.
+                // mult_result is automatically sign-extended from 16-bit to ACC_WIDTH here.
                 psum_out_south <= psum_in_north + mult_result;
 
-                // STEP 3: Update LOCAL accumulator.
-                // This is NOT the same as psum_out_south!
-                // psum_out_south is a pipeline register (passes value south each cycle).
-                // accumulator is a sticky register used for output-stationary mode
-                // or for reading out a final result without forwarding.
+                // STEP 3: Update sticky accumulator.
+                // `clear_acc` resets it for a new output tile, then MACs continue.
                 if (clear_acc) begin
-                    // Start fresh for a new output tile
-                    accumulator <= mult_result;
+                    accumulator <= mult_result; // Start fresh with current product
                 end else begin
-                    // Keep adding to the running total
                     accumulator <= accumulator + mult_result;
                 end
             end
 
         end else begin
-            // -------------------------------------------------------
-            // PE DISABLED — hold outputs stable (no change)
-            // -------------------------------------------------------
-            // This matters during weight loading of OTHER rows:
-            // only one row's PEs have weight_load active at a time,
-            // but all PEs are still 'connected' in the pipeline.
-            //NOTE important for synthesis, FPGA tools use clock enables to save power, and explicit assignments make intent unambiguous
+            // ==================================================================
+            // PE DISABLED — hold outputs stable
+            // ==================================================================
+            // While another row is loading weights (weight_load & weight_row_select[i]=1),
+            // THIS row's PEs have enable=0. We explicitly hold outputs to prevent
+            // latches. FPGA tools (Vivado) use clock enables for power savings,
+            // and explicit assignments like these make the intent unambiguous for synthesis.
             data_out_east  <= data_out_east;
             psum_out_south <= psum_out_south;
         end

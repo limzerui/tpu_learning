@@ -2,7 +2,7 @@
 `timescale 1ns/1ns
 
 // =============================================================================
-// MATRIX CONTROLLER — The Conductor of the TPU Orchestra
+// MATRIX CONTROLLER 
 // =============================================================================
 //
 // WHAT PROBLEM DOES THIS SOLVE?
@@ -11,7 +11,6 @@
 //     - activation_fifo: loads activations, skews them for the array
 //     - systolic_array : does the actual multiply-accumulate
 //     - accumulator    : holds partial results between K-tile passes
-//   But who tells all of them WHEN to start? Who sequences the hand-offs?
 //   That is this module. It is a 14-state FSM that runs the full matmul loop.
 //
 // THE BIG PICTURE — Tiled Matrix Multiply

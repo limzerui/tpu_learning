@@ -190,7 +190,25 @@ module tiling_controller #(
                         tile_n <= 16'd0;
                         tile_k <= 16'd0;
 
+                        addr_a_tile <= base_addr_a;
+                        addr_b_tile <= base_addr_b;
+                        addr_c_tile <= base_addr_c;
+
+                        // Calculate initial tile dimensions
+                        tile_rows_a <= min_dim(TILE_SIZE, matrix_m);
+                        tile_cols_a <= min_dim(TILE_SIZE, matrix_k);
+                        tile_rows_b <= min_dim(TILE_SIZE, matrix_k);
+                        tile_cols_b <= min_dim(TILE_SIZE, matrix_n);
+                        tile_rows_c <= min_dim(TILE_SIZE, matrix_m);
+                        tile_cols_c <= min_dim(TILE_SIZE, matrix_n);
+
+                        first_k_tile <= 1'b1;
+                        last_k_tile <= (num_tiles_k == 1);
+
+                        active <= 1'b1;
+                        state <= RUNNING;
                     end 
+                end
 
                 
             endcase

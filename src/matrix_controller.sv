@@ -60,14 +60,6 @@
 // =============================================================================
 // STEP 1 — MODULE HEADER + PORTS
 // =============================================================================
-// Programmer asks: "who does this module talk to?"
-//   - Host/sequencer: gives us start/config, we signal busy/done
-//   - weight_fifo:    we issue prefetch_start, drain_enable, drain_row_done
-//   - activation_fifo: we issue load_start, stream_enable
-//   - systolic_array:  we issue array_enable, array_weight_load, array_clear_acc
-//   - accumulator:     we issue results_enable, accumulate_mode, quant_enable
-//   - memory controller: we issue write requests for writeback
-//   - tiling controller: it tells us per-tile addresses; we signal tile_advance
 
 module matrix_controller #(
     parameter N          = 8,   // Systolic array dimension
@@ -94,8 +86,8 @@ module matrix_controller #(
 
     // -------------------------------------------------------------------------
     // WEIGHT FIFO INTERFACE
-    // Programmer: "I need to tell weight_fifo to prefetch, then drain
-    //              row by row into the systolic array."
+    // I need to tell weight_fifo to prefetch, then drain
+    // row by row into the systolic array.
     // -------------------------------------------------------------------------
     output reg                  weight_prefetch_start,   // Pulse to begin load
     output reg [ADDR_WIDTH-1:0] weight_prefetch_addr,    // Which SRAM address to fetch from
@@ -178,10 +170,9 @@ module matrix_controller #(
 // =============================================================================
 // STEP 2 — STATE DEFINITIONS
 // =============================================================================
-// Programmer asks: "what are the discrete phases of one tile matmul?"
+// what are the discrete phases of one tile matmul?
 // Draw the sequence diagram:
 //   prefetch B → prefetch A → load weights into PEs → compute → drain → accumulate → writeback
-// Each phase becomes a state. Add "WAIT_*" states for multi-cycle handoffs.
 //
 // Use 4-bit encoding (14 states fits in 4 bits).
 // Use named constants — never use raw 4'b... in the case statement.
@@ -205,7 +196,6 @@ localparam MATMUL_DONE       = 4'd14; // Complete, assert done
 // =============================================================================
 // STEP 3 — INTERNAL STATE REGISTERS
 // =============================================================================
-// Programmer asks: "what do I need to track between clock cycles?"
 //   - The FSM state itself
 //   - A cycle counter (performance measurement)
 //   - Weight row counter (to know when all N rows have been broadcast to PEs)
@@ -232,13 +222,11 @@ assign debug_cycle_count = cycle_count;
 // =============================================================================
 // STEP 5 — THE STATE MACHINE
 // =============================================================================
-// CRITICAL CODING PATTERN: "default pulse reset at top of else begin"
 //
 // Some signals are one-cycle pulses (e.g. prefetch_start, tile_advance).
 // If you set them in a state, you MUST clear them next cycle.
 // Rather than clearing in every other state, declare them 0 at the TOP of
 // the else block. This way they're always 0 UNLESS the current state asserts them.
-// This is standard RTL style for control pulses.
 //
 // Signals that should be cleared this way:
 //   weight_prefetch_start, weight_drain_row_done
@@ -250,8 +238,6 @@ always @(posedge clk) begin
     if (reset) begin
         // =====================================================================
         // RESET: Every output to a safe idle state.
-        // Programmer rule: Every reg driven by this always block must appear here.
-        // If you forget one, it will power up with unknown value in simulation.
         // =====================================================================
         state <= IDLE;
         busy  <= 1'b0;
@@ -297,7 +283,6 @@ always @(posedge clk) begin
         // =====================================================================
         // DEFAULT PULSE CLEAR — runs every cycle before the case statement.
         // Any signal listed here will be 0 unless the current state overrides it.
-        // This is equivalent to "deassert by default, assert only when needed."
         // =====================================================================
         weight_prefetch_start <= 1'b0;  // One-cycle pulse
         weight_drain_row_done <= 1'b0;  // One-cycle pulse
@@ -344,10 +329,10 @@ always @(posedge clk) begin
                 // 3. Set weight_prefetch_rows to N (full tile)
                 // 4. Transition to WAIT_WEIGHTS
 
-                // weight_prefetch_start <= ???
-                // weight_prefetch_addr  <= ???
-                // weight_prefetch_rows  <= ???
-                // state                 <= ???
+                weight_prefetch_start <= 1'b1;
+                weight_prefetch_addr  <= tile_addr_b;
+                weight_prefetch_rows  <= N;
+                state                 <= WAIT_WEIGHTS;
             end
 
             // -----------------------------------------------------------------
@@ -361,11 +346,10 @@ always @(posedge clk) begin
                 // Wait until weight_prefetch_done OR weight_buffer_ready
                 // Then reset weight_row_counter to 0 (used in BROADCAST)
                 // Transition to LOAD_ACTIVATIONS
-
-                // if (???) begin
-                //     weight_row_counter <= 8'd0;
-                //     state <= ???;
-                // end
+                if (weight_prefetch_done || weight_buffer_ready) begin
+                    state <= BROADCAST_WEIGHTS;
+                    weight_row_counter <= 8'd0;
+                end
             end
 
             // -----------------------------------------------------------------
@@ -387,29 +371,28 @@ always @(posedge clk) begin
                 // 5. Set activation_load_stride = matrix_k >> 2  (K/4 words per row)
                 // 6. Transition to WAIT_ACTIVATIONS
 
-                // activation_load_start  <= ???
-                // activation_load_addr   <= ???
-                // activation_load_rows   <= ???
-                // activation_load_cols   <= ???
-                // activation_load_stride <= ???
-                // state                  <= ???
+                activation_load_start <= 1'b1;
+                activation_load_addr  <= tile_addr_a;
+                activation_load_rows  <= N;
+                activation_load_cols  <= N;
+                activation_load_stride <= matrix_k >> 2;
+                state <= WAIT_ACTIVATIONS;
             end
-
             // -----------------------------------------------------------------
             // WAIT_ACTIVATIONS
-            // Same pattern as WAIT_WEIGHTS. Two conditions to check.
+            // Same pattern as WAIT_WEIGHTS
             // -----------------------------------------------------------------
             WAIT_ACTIVATIONS: begin
-                // YOUR CODE HERE:
-                // if (activation_load_done || activation_buffer_ready)
-                //     state <= BROADCAST_WEIGHTS;
+                if (activation_buffer_ready || activation_load_done) begin
+                    state <= BROADCAST_WEIGHTS;
+                    weight_row_counter <= 8'd0;
+                end
             end
 
             // -----------------------------------------------------------------
             // BROADCAST_WEIGHTS
             // Feed weights from weight_fifo into the systolic array PEs.
             //
-            // HOW DOES WEIGHT LOADING WORK?
             //   weight_drain_enable = 1 tells weight_fifo: "start outputting rows"
             //   array_weight_load   = 1 tells systolic array: "load the row you see"
             //   weight_drain_row_done = one-cycle pulse each cycle tells weight_fifo
@@ -424,18 +407,15 @@ always @(posedge clk) begin
             //   and doesn't depend on weight_fifo's internal state.
             // -----------------------------------------------------------------
             BROADCAST_WEIGHTS: begin
-                // YOUR CODE HERE:
-                // Assert array_weight_load = 1
-                // Assert weight_drain_enable = 1
-                // Assert weight_drain_row_done = 1 (pulse every cycle to advance row)
-                // Increment weight_row_counter
-                // When weight_row_counter >= N-1, state <= WAIT_BROADCAST
+                array_weight_load <= 1'b1;
+                weight_drain_enable <= 1'b1;
+                //wait one cycle3 the signal row done
+                weight_drain_row_done <= 1'b1;
+                weight_row_counter <= weight_row_counter + 1'b1;
+                if (weight_row_counter >= N - 1'b1) begin
+                    state <= WAIT_BROADCAST;
+                end
 
-                // array_weight_load      <= ???
-                // weight_drain_enable    <= ???
-                // weight_drain_row_done  <= ???  (this advances weight_fifo each cycle)
-                // weight_row_counter     <= ???
-                // if (???) state <= ???;
             end
 
             // -----------------------------------------------------------------
@@ -456,7 +436,7 @@ always @(posedge clk) begin
 
                 // Only clear accumulator on first K tile (no carry-over expected)
                 if (first_k_tile_reg && !accumulate_mode) begin
-                    array_clear_acc <= 1'b1;
+                    array_clear_acc <= 1'b1; // Reset internal PE accumulators to 0
                 end
 
                 state <= STREAM_COMPUTE;
@@ -479,19 +459,19 @@ always @(posedge clk) begin
             // We wait for activation_stream_done, then go to DRAIN_PIPELINE.
             // -----------------------------------------------------------------
             STREAM_COMPUTE: begin
-                // YOUR CODE HERE:
-                // array_enable             <= 1
-                // array_clear_acc          <= 0 (clear is now done in WAIT_BROADCAST)
-                // activation_stream_enable <= 1
-                // acc_results_enable       <= 1
-                // acc_accumulate_mode      <= (!first_k_tile_reg || accumulate_mode)
-                //   Explanation: accumulate if this is NOT the first K pass,
-                //                OR if global accumulate_mode is set.
-                //
-                // When activation_stream_done:
-                //   de-assert activation_stream_enable
-                //   reset drain_cycle_counter
-                //   state <= DRAIN_PIPELINE
+                array_enable <= 1'b1;
+                activation_stream_enable <= 1'b1;
+                array_clear_acc <= 0;
+
+                //enable result capture
+                acc_results_enable <= 1'b1;
+                acc_accumulate_mode <= !first_k_tile_reg || accumulate_mode;
+
+                if (activation_stream_done) begin
+                    activation_stream_enable <= 1'b0;
+                    drain_cycle_counter <= 1'b0;
+                    state <= DRAIN_PIPELINE;
+                end
             end
 
             // -----------------------------------------------------------------
@@ -507,12 +487,12 @@ always @(posedge clk) begin
             // When drain_cycle_counter >= 2*N, everything has settled.
             // -----------------------------------------------------------------
             DRAIN_PIPELINE: begin
-                // YOUR CODE HERE:
-                // drain_cycle_counter <= drain_cycle_counter + 1;
-                // if (drain_cycle_counter >= 2*N):
-                //   array_enable       <= 0
-                //   acc_results_enable <= 0
-                //   state <= ACCUMULATE
+                drain_cycle_counter <= drain_cycle_counter + 1'b1;
+                if (drain_cycle_counter >= 2*N) begin
+                    array_enable <= 1'b0;
+                    acc_results_enable <= 1'b0;
+                    state <= ACCUMULATE;
+                end
             end
 
             // -----------------------------------------------------------------
@@ -523,11 +503,11 @@ always @(posedge clk) begin
             //   NO  (last_k_tile_reg):     go write back the result
             // -----------------------------------------------------------------
             ACCUMULATE: begin
-                // YOUR CODE HERE:
-                // if (last_k_tile_reg)
-                //     state <= WRITEBACK;
-                // else
-                //     state <= NEXT_K_TILE;
+                if (last_k_tile_reg) begin
+                    state <= WRITEBACK;
+                end else begin
+                    state <= NEXT_K_TILE;
+                end
             end
 
             // -----------------------------------------------------------------
@@ -540,10 +520,9 @@ always @(posedge clk) begin
             // next cycle — but we don't register it here; we let IDLE/LOAD do it.
             // -----------------------------------------------------------------
             NEXT_K_TILE: begin
-                // YOUR CODE HERE:
-                // tile_advance      <= 1 (pulse)
-                // first_k_tile_reg  <= 0 (no longer first K tile)
-                // state             <= LOAD_WEIGHTS (loop back to top)
+                tile_advance     <= 1'b1;
+                first_k_tile_reg <= 1'b0;
+                state            <= LOAD_WEIGHTS;
             end
 
             // -----------------------------------------------------------------
@@ -578,17 +557,18 @@ always @(posedge clk) begin
             //      tile_done = 0 → advance to next tile, go back to LOAD_WEIGHTS.
             // -----------------------------------------------------------------
             WRITEBACK: begin
-                // YOUR CODE HERE:
-                // if (!acc_quant_done):
-                //   acc_quant_enable <= 1  (will auto-clear next cycle by default)
-                // else:
-                //   if (tile_done):
-                //       state <= MATMUL_DONE
-                //   else:
-                //       tile_advance      <= 1
-                //       first_k_tile_reg  <= first_k_tile  (re-register for new tile)
-                //       last_k_tile_reg   <= last_k_tile
-                //       state             <= LOAD_WEIGHTS
+                if (!acc_quant_done) begin
+                    acc_quant_enable <= 1'b1;
+                end else begin
+                    if (tile_done) begin
+                        state <= MATMUL_DONE;
+                    end else begin
+                        tile_advance     <= 1'b1;
+                        first_k_tile_reg <= first_k_tile;
+                        last_k_tile_reg  <= last_k_tile;
+                        state            <= LOAD_WEIGHTS
+                    end
+                end
             end
 
             // -----------------------------------------------------------------
@@ -597,10 +577,9 @@ always @(posedge clk) begin
             // done is a one-cycle pulse — caller latches it.
             // -----------------------------------------------------------------
             MATMUL_DONE: begin
-                // YOUR CODE HERE:
-                // busy  <= 0
-                // done  <= 1
-                // state <= IDLE
+                busy <= 1'b0;
+                done <= 1'b1;
+                state <= IDLE;
             end
 
             default: state <= IDLE;

@@ -149,10 +149,10 @@ module accumulator_buffer #(
     always @(posedge clk) begin
         if (reset || clear_buffer) begin
             // Reset or clear_buffer: initialize capture state and accumulators
-            capturing <= 1'b0;
-            capture_row <= 1'b0;
-            row_valid <= 1'b0;
-            accumulated_rows <= 1'b0;
+            capturing        <= 1'b0;
+            capture_row      <= 3'd0;         // 3-bit reg — must use 3'd0, not 1'b0
+            row_valid        <= {N{1'b0}};    // N-bit bitmask — clear all bits
+            accumulated_rows <= 8'd0;         // 8-bit counter
             
             // Clear all accumulator cells
             for (col = 0; col < N; col = col + 1) begin
@@ -270,7 +270,9 @@ module accumulator_buffer #(
                     else if (quant_shifted < -128)
                         quant_buffer[quant_row][quant_col] <= -8'sd128;
                     else
-                        quant_buffer[quant_row][quant_col] <= quant_shifted[7:0];
+                        // $signed() is CRITICAL: without it quant_shifted[7:0] is treated as
+                        // unsigned, silently corrupting any negative quantized output.
+                        quant_buffer[quant_row][quant_col] <= $signed(quant_shifted[7:0]);
 
                     // Advance the [row][col] scan cursor across all NxN elements.
                     if (quant_col >= N-1) begin

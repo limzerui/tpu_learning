@@ -347,8 +347,7 @@ always @(posedge clk) begin
                 // Then reset weight_row_counter to 0 (used in BROADCAST)
                 // Transition to LOAD_ACTIVATIONS
                 if (weight_prefetch_done || weight_buffer_ready) begin
-                    state <= BROADCAST_WEIGHTS;
-                    weight_row_counter <= 8'd0;
+                    state <= LOAD_ACTIVATIONS;  // ← was incorrectly BROADCAST_WEIGHTS
                 end
             end
 
@@ -564,9 +563,9 @@ always @(posedge clk) begin
                         state <= MATMUL_DONE;
                     end else begin
                         tile_advance     <= 1'b1;
-                        first_k_tile_reg <= first_k_tile;
+                        first_k_tile_reg <= first_k_tile;  // Re-register for new tile
                         last_k_tile_reg  <= last_k_tile;
-                        state            <= LOAD_WEIGHTS
+                        state            <= LOAD_WEIGHTS;  //
                     end
                 end
             end

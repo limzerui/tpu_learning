@@ -210,107 +210,127 @@ module tiling_controller #(
                     end 
                 end
 
-                
+                RUNNING: begin
+                    if (advance) begin
+                        // ─── BRANCH 1: Inner K loop can still advance ─────────────────────
+                        // We are computing more partial sums for the same output tile C[m,n].
+                        // A moves right (same row-stripe, next k-column).
+                        // B moves down (next k-row, same n-column).
+                        // C address does NOT change — still writing the same output tile.
+                        if (tile_k + 1 < num_tiles_k) begin
+                            tile_k       <= tile_k + 1'b1;
+                            first_k_tile <= 1'b0;  // Subsequent K passes use accumulate_mode
+                            // last_k_tile: will the NEXT k-tile be the last one?
+                            last_k_tile  <= (tile_k + 2 >= num_tiles_k);
+
+                            // A[m, k+1]: same row-stripe, next k-column.
+                            // byte offset = tile_m*TILE_SIZE*matrix_k + (tile_k+1)*TILE_SIZE
+                            addr_a_tile <= base_addr_a + ((tile_m * TILE_SIZE * matrix_k + (tile_k + 1) * TILE_SIZE) >> 2);
+
+                            // B[k+1, n]: next k-row, same n-column.
+                            // byte offset = (tile_k+1)*TILE_SIZE*matrix_n + tile_n*TILE_SIZE
+                            addr_b_tile <= base_addr_b + (((tile_k + 1) * TILE_SIZE * matrix_n + tile_n * TILE_SIZE) >> 2);
+
+                            // Edge tile dimensions: the last k-tile may have fewer than TILE_SIZE elements.
+                            tile_cols_a <= min_dim(TILE_SIZE, matrix_k - (tile_k + 1) * TILE_SIZE);
+                            tile_rows_b <= min_dim(TILE_SIZE, matrix_k - (tile_k + 1) * TILE_SIZE);
+
+                        // ─── BRANCH 2: K loop done, advance N ────────────────────────────
+                        // C[m,n] is complete. Move to the next column-tile of C.
+                        // A resets to the start of the same m-row (back to k=0).
+                        // B jumps to the next n-column, starting from its top (k=0).
+                        // C jumps one tile to the right.
+                        end else if (tile_n + 1 < num_tiles_n) begin
+                            tile_k       <= 16'd0;
+                            tile_n       <= tile_n + 1'b1;
+                            first_k_tile <= 1'b1;  // Fresh C tile — overwrite, don't accumulate
+                            last_k_tile  <= (num_tiles_k == 1);
+
+                            // A: reset to start of same m-row (k resets to 0, so no k offset)
+                            addr_a_tile <= base_addr_a + ((tile_m * TILE_SIZE * matrix_k) >> 2);
+
+                            // B: next n-column, k=0 (top of B), so no row offset.
+                            // byte offset = (tile_n+1)*TILE_SIZE  (only col skip, no row skip)
+                            addr_b_tile <= base_addr_b + (((tile_n + 1) * TILE_SIZE) >> 2);
+
+                            // C: same m-row, next n-column.
+                            addr_c_tile <= base_addr_c + ((tile_m * TILE_SIZE * matrix_n + (tile_n + 1) * TILE_SIZE) >> 2);
+
+                            // Edge tile dimensions for the new N column.
+                            tile_cols_a <= min_dim(TILE_SIZE, matrix_k);
+                            tile_rows_b <= min_dim(TILE_SIZE, matrix_k);
+                            tile_cols_b <= min_dim(TILE_SIZE, matrix_n - (tile_n + 1) * TILE_SIZE);
+                            tile_cols_c <= min_dim(TILE_SIZE, matrix_n - (tile_n + 1) * TILE_SIZE);
+
+                            if (loop_check && loop_level == 2'b00) begin
+                                loop_iteration_done <= 1'b1;
+                                loop_target_pc      <= loop_start_pc;
+                            end
+
+                        // ─── BRANCH 3: K and N done, advance M ───────────────────────────
+                        // An entire row-stripe of C is complete. Move to the next row.
+                        // A jumps down to the next m-row, n and k both reset.
+                        // B resets to its base (all m-tiles use the same B).
+                        // C jumps down to the next m-row.
+                        end else if (tile_m + 1 < num_tiles_m) begin
+                            tile_k       <= 16'd0;
+                            tile_n       <= 16'd0;
+                            tile_m       <= tile_m + 1'b1;
+                            first_k_tile <= 1'b1;
+                            last_k_tile  <= (num_tiles_k == 1);
+
+                            // A[m+1, 0]: next m-row, k reset to 0.
+                            addr_a_tile <= base_addr_a + (((tile_m + 1) * TILE_SIZE * matrix_k) >> 2);
+                            // B: reset to base — all m-tiles loop through the same B.
+                            addr_b_tile <= base_addr_b;
+                            // C[m+1, 0]: next m-row, n reset to 0.
+                            addr_c_tile <= base_addr_c + (((tile_m + 1) * TILE_SIZE * matrix_n) >> 2);
+
+                            // Edge tile dimensions for the new M row.
+                            tile_rows_a <= min_dim(TILE_SIZE, matrix_m - (tile_m + 1) * TILE_SIZE);
+                            tile_cols_a <= min_dim(TILE_SIZE, matrix_k);
+                            tile_rows_b <= min_dim(TILE_SIZE, matrix_k);
+                            tile_cols_b <= min_dim(TILE_SIZE, matrix_n);
+                            tile_rows_c <= min_dim(TILE_SIZE, matrix_m - (tile_m + 1) * TILE_SIZE);
+                            tile_cols_c <= min_dim(TILE_SIZE, matrix_n);
+
+                            if (loop_check && loop_level == 2'b01) begin
+                                loop_iteration_done <= 1'b1;
+                                loop_target_pc      <= loop_start_pc;
+                            end
+
+                        // ─── BRANCH 4: All tiles done ─────────────────────────────────────
+                        end else begin
+                            done   <= 1'b1;
+                            active <= 1'b0;
+                            state  <= COMPLETE;
+
+                            if (loop_check && loop_level == 2'b10) begin
+                                loop_iteration_done <= 1'b1;
+                                loop_target_pc      <= loop_start_pc;
+                            end
+                        end
+                    end
+                end
+
+                COMPLETE: begin
+                    // Hold done=1 until a new `start` arrives.
+                    // This allows back-to-back matrix multiplies without requiring a full reset.
+                    if (start) begin
+                        tile_m       <= 16'd0;
+                        tile_n       <= 16'd0;
+                        tile_k       <= 16'd0;
+                        done         <= 1'b0;
+                        active       <= 1'b1;
+                        first_k_tile <= 1'b1;
+                        last_k_tile  <= (num_tiles_k == 1);
+                        state        <= RUNNING;
+                    end
+                end
+
+                default: state <= IDLE;
             endcase
         end
-    end
-    // Inside the always block:
-    //   Reset every reg to safe zero values.
-    //   Default: loop_iteration_done <= 0 (it is a one-cycle pulse)
-
-    // =========================================================================
-    // BLOCK C — IDLE STATE
-    // =========================================================================
-    //
-    // When start pulses:
-    //   1. Set tile_m, tile_n, tile_k = 0
-    //   2. Set addresses:
-    //        addr_a_tile = base_addr_a   (first tile is at base)
-    //        addr_b_tile = base_addr_b
-    //        addr_c_tile = base_addr_c
-    //   3. Set initial tile dimensions using min_dim:
-    //        tile_rows_a = min_dim(TILE_SIZE, matrix_m)   ← may be less if matrix_m < TILE_SIZE
-    //        tile_cols_a = min_dim(TILE_SIZE, matrix_k)
-    //        tile_rows_b = min_dim(TILE_SIZE, matrix_k)
-    //        tile_cols_b = min_dim(TILE_SIZE, matrix_n)
-    //        tile_rows_c = min_dim(TILE_SIZE, matrix_m)
-    //        tile_cols_c = min_dim(TILE_SIZE, matrix_n)
-    //   4. Set first_k_tile = 1, last_k_tile = (num_tiles_k == 1)
-    //   5. Set active = 1, state = RUNNING
-
-    // =========================================================================
-    // BLOCK D — RUNNING STATE (the heart of this module)
-    // =========================================================================
-    //
-    // Wait for `advance`. When it arrives, decide which counter to bump.
-    // Priority: K first, then N, then M, then done.
-    //
-    // ─── BRANCH 1: K can still advance (tile_k + 1 < num_tiles_k) ──────────
-    //   tile_k <= tile_k + 1
-    //   first_k_tile <= 0           (no longer the first K-tile)
-    //   last_k_tile  <= (tile_k + 2 >= num_tiles_k)  ← next tile will be last?
-    //
-    //   Update A address (same m-row, advancing k-column):
-    //     addr_a_tile <= base_addr_a + ((tile_m * TILE_SIZE * matrix_k + (tile_k+1) * TILE_SIZE) >> 2)
-    //
-    //   Update B address (same n-column, advancing k-row):
-    //     addr_b_tile <= base_addr_b + (((tile_k+1) * TILE_SIZE * matrix_n + tile_n * TILE_SIZE) >> 2)
-    //
-    //   Update edge tile dimensions:
-    //     tile_cols_a <= min_dim(TILE_SIZE, matrix_k - (tile_k+1) * TILE_SIZE)
-    //     tile_rows_b <= same
-    //   (C address doesn't change — we're still writing to the same output tile)
-    //
-    // ─── BRANCH 2: N can advance (tile_k done, tile_n + 1 < num_tiles_n) ───
-    //   tile_k <= 0, tile_n <= tile_n + 1
-    //   first_k_tile <= 1, last_k_tile <= (num_tiles_k == 1)
-    //
-    //   Reset A to start of same m-row, k=0:
-    //     addr_a_tile <= base_addr_a + ((tile_m * TILE_SIZE * matrix_k) >> 2)
-    //
-    //   Advance B to next n-column, k=0:
-    //     addr_b_tile <= base_addr_b + (((tile_n+1) * TILE_SIZE) >> 2)
-    //
-    //   Advance C to next n-column of same m-row:
-    //     addr_c_tile <= base_addr_c + ((tile_m * TILE_SIZE * matrix_n + (tile_n+1) * TILE_SIZE) >> 2)
-    //
-    //   Update tile_cols_b, tile_cols_c for edge case:
-    //     min_dim(TILE_SIZE, matrix_n - (tile_n+1)*TILE_SIZE)
-    //   Reset tile_cols_a, tile_rows_b for edge case:
-    //     min_dim(TILE_SIZE, matrix_k)
-    //
-    // ─── BRANCH 3: M can advance (K and N done, tile_m + 1 < num_tiles_m) ──
-    //   tile_k <= 0, tile_n <= 0, tile_m <= tile_m + 1
-    //   first_k_tile <= 1, last_k_tile <= (num_tiles_k == 1)
-    //
-    //   Reset B to base (same B is reused for all m-tiles):
-    //     addr_b_tile <= base_addr_b
-    //   Advance A to next m-row, all k from start:
-    //     addr_a_tile <= base_addr_a + (((tile_m+1) * TILE_SIZE * matrix_k) >> 2)
-    //   Advance C to next m-row, n=0:
-    //     addr_c_tile <= base_addr_c + (((tile_m+1) * TILE_SIZE * matrix_n) >> 2)
-    //
-    //   Update tile_rows_a, tile_rows_c for edge case:
-    //     min_dim(TILE_SIZE, matrix_m - (tile_m+1)*TILE_SIZE)
-    //
-    // ─── BRANCH 4: ALL DONE ──────────────────────────────────────────────────
-    //   done   <= 1
-    //   active <= 0
-    //   state  <= COMPLETE
-
-    // =========================================================================
-    // BLOCK E — COMPLETE STATE
-    // =========================================================================
-    //
-    // Stay here until a new `start` arrives.
-    // On `start`: reset tile_m/n/k = 0, first_k_tile = 1, state = RUNNING
-    // (Allows back-to-back matrix multiplies without a full reset.)
-
-    // =========================================================================
-    // [TODO] Write the always @(posedge clk) block now
-    // =========================================================================
-    always @(posedge clk) begin
-        // YOUR CODE HERE
     end
 
 endmodule

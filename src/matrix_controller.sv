@@ -2,63 +2,49 @@
 `timescale 1ns/1ns
 
 // =============================================================================
-// MATRIX CONTROLLER 
+// MATRIX CONTROLLER
 // =============================================================================
 //
 // WHAT PROBLEM DOES THIS SOLVE?
-//   You now have all the building blocks:
-//     - weight_fifo   : loads weights from SRAM, stages them for the array
-//     - activation_fifo: loads activations, skews them for the array
-//     - systolic_array : does the actual multiply-accumulate
-//     - accumulator    : holds partial results between K-tile passes
-//   That is this module. It is a 14-state FSM that runs the full matmul loop.
+//   You have five powerful components sitting idle:
+//     - weight_fifo       : fetches and stages weight tiles from SRAM
+//     - activation_fifo   : fetches and skews activation tiles
+//     - systolic_array    : does the actual multiply-accumulate
+//     - accumulator_buffer: holds partial sums between K-tile passes
+//     - tiling_controller : knows which tile to process next
+//
+//   This module is the conductor. It is a 14-state FSM that sequences all five
+//   to execute one complete tiled matrix multiply: C = A × B.
 //
 // THE BIG PICTURE — Tiled Matrix Multiply
-//   To multiply two large matrices A(M×K) × B(K×N) = C(M×N):
-//   The result doesn't fit in one NxN systolic array pass.
-//   So you tile — you chop A and B into NxN blocks and accumulate.
+//   To multiply A(M×K) × B(K×N) = C(M×N) on an N×N systolic array:
+//   Chop A and B into N×N tiles and accumulate partial results:
 //
-//   The three nested loops, which become the tile iteration order:
-//     for each M-tile (rows of A / rows of C):          ← outer loop
-//       for each N-tile (cols of B / cols of C):        ← middle loop
-//         for each K-tile (inner dimension, shared):    ← inner loop
+//     for each M-tile (rows of A / rows of C):       ← outer loop
+//       for each N-tile (cols of B / cols of C):     ← middle loop
+//         for each K-tile (shared inner dimension):  ← inner loop
 //           C[m][n] += A[m][k] × B[k][n]
 //
-//   This controller runs ONE full pass through all K-tiles for a given (m,n).
-//   The tiling_controller module handles iterating m and n — it tells us
-//   the addresses and sizes for each tile via the tile_* ports.
+//   tiling_controller iterates (m,n,k) and provides tile addresses.
+//   This controller drives the load → broadcast → compute → writeback sequence.
 //
 // THE 14 STATES IN ORDER:
 //   IDLE              → Wait for start pulse
-//   LOAD_WEIGHTS      → Kick off weight_fifo prefetch
+//   LOAD_WEIGHTS      → Kick off weight_fifo prefetch of B tile
 //   WAIT_WEIGHTS      → Wait until weight_fifo has the full tile
-//   LOAD_ACTIVATIONS  → Kick off activation_fifo load
+//   LOAD_ACTIVATIONS  → Kick off activation_fifo load of A tile
 //   WAIT_ACTIVATIONS  → Wait until activation_fifo has the full tile
-//   BROADCAST_WEIGHTS → Feed weights from FIFO into the systolic array PEs
-//   WAIT_BROADCAST    → One-cycle settle; optionally clear accumulators
-//   STREAM_COMPUTE    → Stream activations, array computes MACs each cycle
-//   DRAIN_PIPELINE    → Wait for the last partial sum to exit the array
-//   ACCUMULATE        → Decide: more K-tiles? or done with this (m,n)?
+//   BROADCAST_WEIGHTS → Feed weight_fifo rows into systolic array PEs (N cycles)
+//   WAIT_BROADCAST    → One-cycle settle; clear accumulators on first K-tile
+//   STREAM_COMPUTE    → Stream activations; array computes MACs each cycle
+//   DRAIN_PIPELINE    → Wait 2N cycles for last partial sum to exit the array
+//   ACCUMULATE        → More K-tiles? loop. Otherwise: writeback.
 //   NEXT_K_TILE       → Advance inner loop counter, loop back to LOAD_WEIGHTS
-//   NEXT_N_TILE       → Advance middle loop counter (handled by tiling ctrl)
-//   NEXT_M_TILE       → Advance outer loop counter (handled by tiling ctrl)
-//   WRITEBACK         → Quantize accumulated result, write C tile to memory
-//   DONE              → Assert done, return to IDLE
+//   NEXT_N_TILE       → Advance middle loop counter (via tiling_controller)
+//   NEXT_M_TILE       → Advance outer loop counter (via tiling_controller)
+//   WRITEBACK         → Quantize accumulated result; write C tile to memory
+//   MATMUL_DONE       → Assert done, return to IDLE
 //
-// CODER THOUGHT PROCESS:
-//   Step 1: Define the ports — what does this module need to CONTROL?
-//           It drives every other module. So its outputs are the control
-//           signals of weight_fifo, activation_fifo, systolic_array, accumulator.
-//           Its inputs are the "done" and "ready" signals back from each.
-//   Step 2: Enumerate the states — draw the FSM on paper first.
-//           For each state ask: "what do I assert, what do I wait for?"
-//   Step 3: Write the state register + reset block (all outputs zeroed).
-//   Step 4: Write the default pulse resets (one-cycle-pulse signals at top
-//           of else begin, so you don't have to clear them in every state).
-//   Step 5: Fill in each case state one by one, referring to the diagram.
-
-// =============================================================================
-// STEP 1 — MODULE HEADER + PORTS
 // =============================================================================
 
 module matrix_controller #(
@@ -69,7 +55,7 @@ module matrix_controller #(
     input wire reset,
 
     // -------------------------------------------------------------------------
-    // HOST / SEQUENCER INTERFACE
+    // Host / Sequencer Interface
     // -------------------------------------------------------------------------
     input wire  start,            // Pulse: begin one matmul operation
     input wire  accumulate_mode,  // If 1, add to existing C instead of replacing
@@ -85,44 +71,42 @@ module matrix_controller #(
     input wire [ADDR_WIDTH-1:0] addr_c,   // Base address of result C in SRAM
 
     // -------------------------------------------------------------------------
-    // WEIGHT FIFO INTERFACE
-    // I need to tell weight_fifo to prefetch, then drain
-    // row by row into the systolic array.
+    // Weight FIFO Interface
     // -------------------------------------------------------------------------
     output reg                  weight_prefetch_start,   // Pulse to begin load
-    output reg [ADDR_WIDTH-1:0] weight_prefetch_addr,    // Which SRAM address to fetch from
-    output reg [7:0]            weight_prefetch_rows,    // How many rows to fetch
-    input wire                  weight_prefetch_done,    // weight_fifo: "tile loaded"
-    input wire                  weight_buffer_ready,     // weight_fifo: "ready to drain"
+    output reg [ADDR_WIDTH-1:0] weight_prefetch_addr,    // SRAM address to fetch from
+    output reg [7:0]            weight_prefetch_rows,    // Number of rows to fetch
+    input wire                  weight_prefetch_done,    // weight_fifo: tile loaded
+    input wire                  weight_buffer_ready,     // weight_fifo: ready to drain
     output reg                  weight_drain_enable,     // Allow weight_fifo to drain
-    output reg                  weight_drain_row_done,   // Pulse: PE row loaded, next row please
-    input wire                  weight_buffer_empty,     // weight_fifo: "all rows drained"
+    output reg                  weight_drain_row_done,   // Pulse: PE row loaded, advance
+    input wire                  weight_buffer_empty,     // weight_fifo: all rows drained
 
     // -------------------------------------------------------------------------
-    // ACTIVATION FIFO INTERFACE
+    // Activation FIFO Interface
     // -------------------------------------------------------------------------
     output reg                  activation_load_start,
     output reg [ADDR_WIDTH-1:0] activation_load_addr,
     output reg [7:0]            activation_load_rows,
     output reg [7:0]            activation_load_cols,
-    output reg [ADDR_WIDTH-1:0] activation_load_stride,  // Row stride in SRAM words
+    output reg [ADDR_WIDTH-1:0] activation_load_stride,  // Row stride in SRAM words (K/4)
     input wire                  activation_load_done,
     input wire                  activation_buffer_ready,
     output reg                  activation_stream_enable, // Start streaming to array
     input wire                  activation_stream_done,   // All activations sent
 
     // -------------------------------------------------------------------------
-    // SYSTOLIC ARRAY INTERFACE
+    // Systolic Array Interface
     // -------------------------------------------------------------------------
     output reg          array_enable,       // Clock-gate / enable the array
-    output reg          array_weight_load,  // Tell array: we're loading weights now
+    output reg          array_weight_load,  // High during weight broadcast phase
     output reg          array_clear_acc,    // Reset internal PE accumulators to 0
-    input wire [N-1:0]  array_result_valid, // Array: "column N outputs valid"
+    input wire [N-1:0]  array_result_valid, // Per-column output valid flags
 
     // -------------------------------------------------------------------------
-    // ACCUMULATOR INTERFACE
-    // The accumulator holds partial sums between K-tile passes.
-    // On the last K-tile, we quantize (scale INT32→INT8) and write back.
+    // Accumulator Interface
+    // Holds partial sums between K-tile passes.
+    // On the last K-tile, quantizes (INT32 → INT8) and prepares for writeback.
     // -------------------------------------------------------------------------
     output reg        acc_results_enable,   // Capture array outputs this cycle
     output reg        acc_accumulate_mode,  // Add to existing (vs overwrite)
@@ -133,8 +117,8 @@ module matrix_controller #(
     input wire        acc_quant_done,       // Quantization complete, data ready
 
     // -------------------------------------------------------------------------
-    // MEMORY CONTROLLER INTERFACE (writeback only)
-    // After quantization, we DMA the result tile back to SRAM.
+    // Memory Controller Interface (writeback only)
+    // After quantization, DMA the result tile back to SRAM.
     // -------------------------------------------------------------------------
     output reg                  mem_write_req,
     output reg [ADDR_WIDTH-1:0] mem_write_addr,
@@ -142,9 +126,9 @@ module matrix_controller #(
     input wire                  mem_write_ack,
 
     // -------------------------------------------------------------------------
-    // TILING CONTROLLER INTERFACE
-    // tiling_controller iterates (m, n, k) tile indices and gives us addresses.
-    // We pulse tile_advance when done with one tile to get the next.
+    // Tiling Controller Interface
+    // Iterates (m, n, k) tile indices and provides tile addresses.
+    // Pulse tile_advance when done with one tile to get the next.
     // -------------------------------------------------------------------------
     output reg                  tile_advance,    // Pulse: move to next tile
     input wire                  tile_done,       // No more tiles to process
@@ -160,85 +144,64 @@ module matrix_controller #(
     input wire [7:0]            tile_cols,        // Valid cols in this tile (may be < N)
 
     // -------------------------------------------------------------------------
-    // STATUS / DEBUG
+    // Status / Debug
     // -------------------------------------------------------------------------
-    output reg [3:0]  matmul_state,
+    output reg [3:0]   matmul_state,
     output wire [31:0] debug_cycle_count,
     output wire [3:0]  debug_state
 );
 
 // =============================================================================
-// STEP 2 — STATE DEFINITIONS
+// STATE DEFINITIONS
 // =============================================================================
-// what are the discrete phases of one tile matmul?
-// Draw the sequence diagram:
-//   prefetch B → prefetch A → load weights into PEs → compute → drain → accumulate → writeback
-//
-// Use 4-bit encoding (14 states fits in 4 bits).
-// Use named constants — never use raw 4'b... in the case statement.
 
 localparam IDLE              = 4'd0;
 localparam LOAD_WEIGHTS      = 4'd1;
 localparam WAIT_WEIGHTS      = 4'd2;
 localparam LOAD_ACTIVATIONS  = 4'd3;
 localparam WAIT_ACTIVATIONS  = 4'd4;
-localparam BROADCAST_WEIGHTS = 4'd5;  // Feed weight_fifo rows into systolic array PEs
-localparam WAIT_BROADCAST    = 4'd6;  // One-cycle settle before compute
-localparam STREAM_COMPUTE    = 4'd7;  // Stream activations, array computes
-localparam DRAIN_PIPELINE    = 4'd8;  // Wait 2N cycles for last sum to drain
-localparam ACCUMULATE        = 4'd9;  // Decide: next K tile or writeback?
-localparam NEXT_K_TILE       = 4'd10; // Inner loop advance
-localparam NEXT_N_TILE       = 4'd11; // Middle loop advance (via tiling controller)
-localparam NEXT_M_TILE       = 4'd12; // Outer loop advance (via tiling controller)
-localparam WRITEBACK         = 4'd13; // Quantize + DMA result tile to SRAM
-localparam MATMUL_DONE       = 4'd14; // Complete, assert done
+localparam BROADCAST_WEIGHTS = 4'd5;
+localparam WAIT_BROADCAST    = 4'd6;
+localparam STREAM_COMPUTE    = 4'd7;
+localparam DRAIN_PIPELINE    = 4'd8;
+localparam ACCUMULATE        = 4'd9;
+localparam NEXT_K_TILE       = 4'd10;
+localparam NEXT_N_TILE       = 4'd11;
+localparam NEXT_M_TILE       = 4'd12;
+localparam WRITEBACK         = 4'd13;
+localparam MATMUL_DONE       = 4'd14;
 
 // =============================================================================
-// STEP 3 — INTERNAL STATE REGISTERS
+// INTERNAL REGISTERS
 // =============================================================================
-//   - The FSM state itself
-//   - A cycle counter (performance measurement)
-//   - Weight row counter (to know when all N rows have been broadcast to PEs)
-//   - Pipeline drain counter (to wait 2N cycles for results to drain)
-//   - Copies of first_k_tile and last_k_tile (registered so they're stable)
-//   - Writeback position (row/col into the C tile)
 
 reg [3:0]  state;
 reg [31:0] cycle_count;
 reg [7:0]  weight_row_counter;   // Counts 0..N-1 during BROADCAST_WEIGHTS
-reg [7:0]  drain_cycle_counter;  // Counts 0..2N during DRAIN_PIPELINE
-reg        first_k_tile_reg;     // Registered copy — stable throughout state machine
+reg [7:0]  drain_cycle_counter;  // Counts up during DRAIN_PIPELINE
+reg        first_k_tile_reg;     // Registered copy — stable throughout a tile pass
 reg        last_k_tile_reg;
-reg        writeback_row;        // 1-bit: which row of accumulator we're writing
+reg        writeback_row;        // Which row of accumulator we're writing back
 reg [7:0]  writeback_col;        // Column position during writeback
 
 // =============================================================================
-// STEP 4 — DEBUG / STATUS COMBINATIONAL OUTPUTS
+// COMBINATIONAL OUTPUTS
 // =============================================================================
+
 assign debug_state       = state;
 assign debug_cycle_count = cycle_count;
-// matmul_state drives external status registers — just mirror the internal state
 
 // =============================================================================
-// STEP 5 — THE STATE MACHINE
+// FSM
 // =============================================================================
 //
-// Some signals are one-cycle pulses (e.g. prefetch_start, tile_advance).
-// If you set them in a state, you MUST clear them next cycle.
-// Rather than clearing in every other state, declare them 0 at the TOP of
-// the else block. This way they're always 0 UNLESS the current state asserts them.
-//
-// Signals that should be cleared this way:
-//   weight_prefetch_start, weight_drain_row_done
-//   activation_load_start
-//   acc_clear, acc_quant_enable
-//   tile_advance
+// One-cycle pulse signals are cleared at the top of the else block every cycle.
+// They stay 0 unless the active state explicitly asserts them.
+// Pulse signals: weight_prefetch_start, weight_drain_row_done,
+//                activation_load_start, acc_clear, acc_quant_enable, tile_advance.
 
 always @(posedge clk) begin
     if (reset) begin
-        // =====================================================================
-        // RESET: Every output to a safe idle state.
-        // =====================================================================
         state <= IDLE;
         busy  <= 1'b0;
         done  <= 1'b0;
@@ -280,27 +243,22 @@ always @(posedge clk) begin
         writeback_col            <= 8'd0;
 
     end else begin
-        // =====================================================================
-        // DEFAULT PULSE CLEAR — runs every cycle before the case statement.
-        // Any signal listed here will be 0 unless the current state overrides it.
-        // =====================================================================
-        weight_prefetch_start <= 1'b0;  // One-cycle pulse
-        weight_drain_row_done <= 1'b0;  // One-cycle pulse
-        activation_load_start <= 1'b0;  // One-cycle pulse
-        acc_clear             <= 1'b0;  // One-cycle pulse
-        acc_quant_enable      <= 1'b0;  // One-cycle pulse
-        tile_advance          <= 1'b0;  // One-cycle pulse
+        // Default: clear all one-cycle pulses
+        weight_prefetch_start <= 1'b0;
+        weight_drain_row_done <= 1'b0;
+        activation_load_start <= 1'b0;
+        acc_clear             <= 1'b0;
+        acc_quant_enable      <= 1'b0;
+        tile_advance          <= 1'b0;
 
-        // Count cycles while busy (performance counter)
         if (busy) cycle_count <= cycle_count + 1;
 
         case (state)
+
             // -----------------------------------------------------------------
-            // IDLE
-            // Wait for start. When it arrives, register tile info and go.
-            // WHY register first_k_tile? The tiling controller drives this wire
-            // combinationally. If we move to LOAD_WEIGHTS the same cycle we
-            // register it, it's stable throughout all sub-states that follow.
+            // IDLE — wait for start; register tile flags before entering FSM.
+            // WHY register first/last_k_tile? tiling_controller drives them
+            // combinationally; latching on entry keeps them stable mid-pass.
             // -----------------------------------------------------------------
             IDLE: begin
                 done        <= 1'b0;
@@ -308,27 +266,16 @@ always @(posedge clk) begin
 
                 if (start) begin
                     busy             <= 1'b1;
-                    first_k_tile_reg <= first_k_tile;  // Register before tiling_ctrl changes it
+                    first_k_tile_reg <= first_k_tile;
                     last_k_tile_reg  <= last_k_tile;
                     state            <= LOAD_WEIGHTS;
                 end
             end
 
             // -----------------------------------------------------------------
-            // LOAD_WEIGHTS
-            // Tell weight_fifo to prefetch the B tile from SRAM.
-            // weight_prefetch_start is a one-cycle pulse — the default clear
-            // above handles de-assertion automatically next cycle.
-            // tile_addr_b comes from the tiling controller — it computes the
-            // correct SRAM address for B[k_tile][n_tile].
+            // LOAD_WEIGHTS — pulse weight_fifo to prefetch the B tile from SRAM.
             // -----------------------------------------------------------------
             LOAD_WEIGHTS: begin
-                // YOUR CODE HERE:
-                // 1. Assert weight_prefetch_start for one cycle (it's a pulse)
-                // 2. Set weight_prefetch_addr to the current B tile address
-                // 3. Set weight_prefetch_rows to N (full tile)
-                // 4. Transition to WAIT_WEIGHTS
-
                 weight_prefetch_start <= 1'b1;
                 weight_prefetch_addr  <= tile_addr_b;
                 weight_prefetch_rows  <= N;
@@ -336,170 +283,113 @@ always @(posedge clk) begin
             end
 
             // -----------------------------------------------------------------
-            // WAIT_WEIGHTS
-            // Stall until weight_fifo signals the tile is loaded.
-            // Two conditions because weight_fifo may have loaded it already
-            // (double-buffering) — weight_buffer_ready is also checked.
+            // WAIT_WEIGHTS — stall until weight_fifo confirms tile is loaded.
+            // weight_buffer_ready handles the case where double-buffering means
+            // the tile was already prefetched.
             // -----------------------------------------------------------------
             WAIT_WEIGHTS: begin
-                // YOUR CODE HERE:
-                // Wait until weight_prefetch_done OR weight_buffer_ready
-                // Then reset weight_row_counter to 0 (used in BROADCAST)
-                // Transition to LOAD_ACTIVATIONS
                 if (weight_prefetch_done || weight_buffer_ready) begin
-                    state <= LOAD_ACTIVATIONS;  // ← was incorrectly BROADCAST_WEIGHTS
+                    state <= LOAD_ACTIVATIONS;
                 end
             end
 
             // -----------------------------------------------------------------
-            // LOAD_ACTIVATIONS
-            // Tell activation_fifo to load the A tile from SRAM.
+            // LOAD_ACTIVATIONS — pulse activation_fifo to load the A tile.
             //
-            // KEY DESIGN DECISION — activation_load_stride:
-            //   Activations are stored row-major in memory. Matrix A has K columns.
-            //   Each word holds 4 INT8s, so stride = K/4 = K >> 2.
-            //   This is how activation_fifo knows how many words to skip
-            //   to go from row i to row i+1 of this tile in memory.
+            // activation_load_stride = matrix_k >> 2:
+            //   A is stored row-major; each SRAM word holds 4 INT8 values.
+            //   Stride = K / 4 words to step from one row to the next in memory.
             // -----------------------------------------------------------------
             LOAD_ACTIVATIONS: begin
-                // YOUR CODE HERE:
-                // 1. Assert activation_load_start (one-cycle pulse)
-                // 2. Set activation_load_addr to current A tile address
-                // 3. Set activation_load_rows to N
-                // 4. Set activation_load_cols to N
-                // 5. Set activation_load_stride = matrix_k >> 2  (K/4 words per row)
-                // 6. Transition to WAIT_ACTIVATIONS
-
-                activation_load_start <= 1'b1;
-                activation_load_addr  <= tile_addr_a;
-                activation_load_rows  <= N;
-                activation_load_cols  <= N;
+                activation_load_start  <= 1'b1;
+                activation_load_addr   <= tile_addr_a;
+                activation_load_rows   <= N;
+                activation_load_cols   <= N;
                 activation_load_stride <= matrix_k >> 2;
-                state <= WAIT_ACTIVATIONS;
+                state                  <= WAIT_ACTIVATIONS;
             end
+
             // -----------------------------------------------------------------
-            // WAIT_ACTIVATIONS
-            // Same pattern as WAIT_WEIGHTS
+            // WAIT_ACTIVATIONS — same pattern as WAIT_WEIGHTS.
+            // Reset weight_row_counter here so BROADCAST_WEIGHTS starts at row 0.
             // -----------------------------------------------------------------
             WAIT_ACTIVATIONS: begin
                 if (activation_buffer_ready || activation_load_done) begin
-                    state <= BROADCAST_WEIGHTS;
                     weight_row_counter <= 8'd0;
+                    state              <= BROADCAST_WEIGHTS;
                 end
             end
 
             // -----------------------------------------------------------------
-            // BROADCAST_WEIGHTS
-            // Feed weights from weight_fifo into the systolic array PEs.
-            //
-            //   weight_drain_enable = 1 tells weight_fifo: "start outputting rows"
-            //   array_weight_load   = 1 tells systolic array: "load the row you see"
-            //   weight_drain_row_done = one-cycle pulse each cycle tells weight_fifo
-            //   to advance to the next row.
-            //
-            //   We do this for N cycles — one cycle per row of the weight tile.
-            //   weight_row_counter tracks how many rows we've loaded.
-            //   When weight_row_counter reaches N-1, next cycle we go to WAIT_BROADCAST.
-            //
-            // WHY NOT WAIT FOR weight_buffer_empty?
-            //   We know exactly how many rows to load (N), so counting is simpler
-            //   and doesn't depend on weight_fifo's internal state.
+            // BROADCAST_WEIGHTS — feed N weight rows into the systolic array,
+            // one row per cycle. weight_drain_row_done pulses each cycle to
+            // advance weight_fifo to the next row.
             // -----------------------------------------------------------------
             BROADCAST_WEIGHTS: begin
-                array_weight_load <= 1'b1;
-                weight_drain_enable <= 1'b1;
-                //wait one cycle3 the signal row done
+                array_weight_load     <= 1'b1;
+                weight_drain_enable   <= 1'b1;
                 weight_drain_row_done <= 1'b1;
-                weight_row_counter <= weight_row_counter + 1'b1;
+                weight_row_counter    <= weight_row_counter + 1'b1;
+
                 if (weight_row_counter >= N - 1'b1) begin
                     state <= WAIT_BROADCAST;
                 end
-
             end
 
             // -----------------------------------------------------------------
-            // WAIT_BROADCAST
-            // De-assert weight loading signals.
-            // If this is the FIRST K-tile AND accumulate_mode is off:
-            //   assert array_clear_acc for one cycle (reset PE accumulators to 0)
-            // If this is a subsequent K-tile: don't clear (we want to accumulate)
-            //
-            // WHY CLEAR ONLY ON FIRST K-TILE?
-            //   C = A[:,0:k]*B[0:k,:] + A[:,k:2k]*B[k:2k,:] + ...
-            //   First pass: overwrite (clear=1). Subsequent passes: add (clear=0).
+            // WAIT_BROADCAST — de-assert weight load signals; give PEs one cycle
+            // to settle. Clear PE accumulators only on the first K-tile pass —
+            // subsequent passes must accumulate into the existing partial sum.
             // -----------------------------------------------------------------
             WAIT_BROADCAST: begin
-                // YOUR CODE HERE:
-                array_weight_load  <= 1'b0;
+                array_weight_load   <= 1'b0;
                 weight_drain_enable <= 1'b0;
 
-                // Only clear accumulator on first K tile (no carry-over expected)
                 if (first_k_tile_reg && !accumulate_mode) begin
-                    array_clear_acc <= 1'b1; // Reset internal PE accumulators to 0
+                    array_clear_acc <= 1'b1;
                 end
 
                 state <= STREAM_COMPUTE;
             end
 
             // -----------------------------------------------------------------
-            // STREAM_COMPUTE
-            // The main compute phase. Three things happen simultaneously:
-            //   1. array_enable = 1           → systolic array is clocked and computing
-            //   2. activation_stream_enable=1  → activation_fifo starts streaming rows
-            //   3. acc_results_enable = 1      → accumulator captures output columns
-            //
-            // acc_accumulate_mode:
-            //   HIGH if this is not the first K-tile (we're adding to existing C)
-            //   HIGH if accumulate_mode is set globally
-            //   LOW  if this is the first K-tile and not in accumulate_mode
-            //         (first pass should overwrite, not add to garbage)
-            //
-            // Streaming runs for 2N-1 cycles autonomously inside activation_fifo.
-            // We wait for activation_stream_done, then go to DRAIN_PIPELINE.
+            // STREAM_COMPUTE — enable array and stream activations.
+            // acc_accumulate_mode is HIGH on any pass after the first K-tile,
+            // so the accumulator adds rather than overwrites.
+            // Streaming runs autonomously inside activation_fifo for 2N-1 cycles.
             // -----------------------------------------------------------------
             STREAM_COMPUTE: begin
-                array_enable <= 1'b1;
+                array_enable             <= 1'b1;
                 activation_stream_enable <= 1'b1;
-                array_clear_acc <= 0;
-
-                //enable result capture
-                acc_results_enable <= 1'b1;
-                acc_accumulate_mode <= !first_k_tile_reg || accumulate_mode;
+                array_clear_acc          <= 1'b0;
+                acc_results_enable       <= 1'b1;
+                acc_accumulate_mode      <= !first_k_tile_reg || accumulate_mode;
 
                 if (activation_stream_done) begin
                     activation_stream_enable <= 1'b0;
-                    drain_cycle_counter <= 1'b0;
-                    state <= DRAIN_PIPELINE;
+                    drain_cycle_counter      <= 8'd0;
+                    state                    <= DRAIN_PIPELINE;
                 end
             end
 
             // -----------------------------------------------------------------
-            // DRAIN_PIPELINE
-            // After activations stop streaming, partial sums are still flowing
-            // through the systolic array pipeline.
-            // The deepest path is N PEs, so we wait 2N cycles to be safe.
-            //
-            // During this time:
-            //   array_enable stays HIGH (pipeline is still flushing)
-            //   acc_results_enable stays HIGH (still capturing results)
-            //
-            // When drain_cycle_counter >= 2*N, everything has settled.
+            // DRAIN_PIPELINE — partial sums are still in flight after activations
+            // stop. Keep array and accumulator capture active for 2N cycles to
+            // flush the deepest pipeline path (N PE stages).
             // -----------------------------------------------------------------
             DRAIN_PIPELINE: begin
                 drain_cycle_counter <= drain_cycle_counter + 1'b1;
-                if (drain_cycle_counter >= 2*N) begin
-                    array_enable <= 1'b0;
+
+                if (drain_cycle_counter >= 2 * N) begin
+                    array_enable       <= 1'b0;
                     acc_results_enable <= 1'b0;
-                    state <= ACCUMULATE;
+                    state              <= ACCUMULATE;
                 end
             end
 
             // -----------------------------------------------------------------
-            // ACCUMULATE
-            // Results are now in the accumulator buffer.
-            // Decision point: are there more K-tiles?
-            //   YES (not last_k_tile_reg): loop back via NEXT_K_TILE
-            //   NO  (last_k_tile_reg):     go write back the result
+            // ACCUMULATE — results are in the accumulator buffer.
+            // If more K-tiles remain, loop back. Otherwise write back.
             // -----------------------------------------------------------------
             ACCUMULATE: begin
                 if (last_k_tile_reg) begin
@@ -510,29 +400,22 @@ always @(posedge clk) begin
             end
 
             // -----------------------------------------------------------------
-            // NEXT_K_TILE
-            // Advance the inner K loop.
-            // tile_advance is a one-cycle pulse to the tiling controller.
-            // After it, tile_addr_a/b update to the next K-tile addresses.
-            // first_k_tile_reg becomes 0 (we're no longer on the first pass).
-            // last_k_tile_reg will be updated from the tiling controller signals
-            // next cycle — but we don't register it here; we let IDLE/LOAD do it.
+            // NEXT_K_TILE — advance the inner K loop via tiling_controller.
+            // Clear first_k_tile_reg; re-register last_k_tile_reg from the
+            // updated tiling_controller output for the upcoming tile.
             // -----------------------------------------------------------------
             NEXT_K_TILE: begin
                 tile_advance     <= 1'b1;
                 first_k_tile_reg <= 1'b0;
+                last_k_tile_reg  <= last_k_tile;
                 state            <= LOAD_WEIGHTS;
             end
 
             // -----------------------------------------------------------------
-            // NEXT_N_TILE / NEXT_M_TILE
-            // These advance the tiling controller to the next (n) or (m) tile.
-            // In this reference, both just pulse tile_advance and return to
-            // LOAD_WEIGHTS — the tiling_controller handles address computation.
-            // first_k_tile_reg is reset to 1 because we're starting a new (m,n).
-            // Note: NEXT_N_TILE and NEXT_M_TILE are never explicitly transitioned
-            // to in this reference FSM — the WRITEBACK → LOAD_WEIGHTS path uses
-            // tile_advance directly. These states exist for completeness.
+            // NEXT_N_TILE / NEXT_M_TILE — advance middle / outer loop.
+            // Reset first_k_tile_reg to 1 since we're starting a fresh (m,n) tile.
+            // Note: in the current FSM, WRITEBACK transitions directly to LOAD_WEIGHTS
+            // via tile_advance; these states exist for explicit loop control if needed.
             // -----------------------------------------------------------------
             NEXT_N_TILE: begin
                 tile_advance     <= 1'b1;
@@ -547,13 +430,9 @@ always @(posedge clk) begin
             end
 
             // -----------------------------------------------------------------
-            // WRITEBACK
-            // C tile is in the accumulator. Two steps:
-            //   1. Quantize: scale INT32 partial sums → INT8 output.
-            //      Assert acc_quant_enable (one-cycle pulse). Wait for acc_quant_done.
-            //   2. After quant_done: check if there are more tiles.
-            //      tile_done = 1 → all done, go to MATMUL_DONE.
-            //      tile_done = 0 → advance to next tile, go back to LOAD_WEIGHTS.
+            // WRITEBACK — quantize INT32 partial sums → INT8, then check if
+            // there are more tiles. tile_done = 0: advance and loop back.
+            // tile_done = 1: all tiles complete, go to MATMUL_DONE.
             // -----------------------------------------------------------------
             WRITEBACK: begin
                 if (!acc_quant_done) begin
@@ -563,30 +442,29 @@ always @(posedge clk) begin
                         state <= MATMUL_DONE;
                     end else begin
                         tile_advance     <= 1'b1;
-                        first_k_tile_reg <= first_k_tile;  // Re-register for new tile
+                        first_k_tile_reg <= first_k_tile;
                         last_k_tile_reg  <= last_k_tile;
-                        state            <= LOAD_WEIGHTS;  //
+                        state            <= LOAD_WEIGHTS;
                     end
                 end
             end
 
             // -----------------------------------------------------------------
-            // MATMUL_DONE
-            // Assert done for one cycle. De-assert busy. Return to IDLE.
-            // done is a one-cycle pulse — caller latches it.
+            // MATMUL_DONE — assert done for one cycle, drop busy, return to IDLE.
             // -----------------------------------------------------------------
             MATMUL_DONE: begin
-                busy <= 1'b0;
-                done <= 1'b1;
+                busy  <= 1'b0;
+                done  <= 1'b1;
                 state <= IDLE;
             end
 
             default: state <= IDLE;
+
         endcase
     end
 end
 
-// Drive matmul_state output
+// Mirror internal state to the external status port
 always @(posedge clk) begin
     matmul_state <= state;
 end

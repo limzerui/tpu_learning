@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /Users/zeruilim/Documents/Documents-ZeruisMacBookPro/Coding/tpu/src/*.sv)"
+    ]
+  }
+}

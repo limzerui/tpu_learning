@@ -146,14 +146,128 @@ module decoder (
             is_memory_op <= 1'b0;
             is_compute_op <= 1'b0;
             is_control_op <= 1'b0;
+            // Decode based on opcode
+            case (instruction[31:24])
+                OP_NOP: begin
+                    is_control_op <= 1'b1;
+                end
 
+                OP_LOAD_W: begin
+                    mem_read_enable <= 1'b1;
+                    mem_target <= 2'b00;  // Weights region
+                    array_weight_load <= 1'b1;
+                    is_memory_op <= 1'b1;
+                end
+
+                OP_LOAD_A: begin
+                    // Load activations from unified buffer to activation FIFO
+                    mem_read_enable <= 1'b1;
+                    mem_target <= 2'b01;  // Activations region
+                    is_memory_op <= 1'b1;
+                end
+
+                OP_MATMUL: begin
+                    // Execute matrix multiplication on systolic array
+                    array_enable <= 1'b1;
+                    array_clear_acc <= ~instruction[20];  // Clear unless accumulate flag set
+                    matmul_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_STORE: begin
+                    // Store results from accumulator to unified buffer
+                    mem_write_enable <= 1'b1;
+                    mem_target <= 2'b10;  // Outputs region
+                    is_memory_op <= 1'b1;
+                end
+
+                OP_ACT_RELU: begin
+                    // Apply ReLU activation
+                    activation_enable <= 1'b1;
+                    activation_func <= 3'b000;  // ReLU
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_ACT_GELU: begin
+                    // Apply GELU activation
+                    activation_enable <= 1'b1;
+                    activation_func <= 3'b001;  // GELU
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_ACT_SILU: begin
+                    // Apply SiLU/Swish activation
+                    activation_enable <= 1'b1;
+                    activation_func <= 3'b010;  // SiLU
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_SOFTMAX: begin
+                    // Apply softmax (multi-pass)
+                    softmax_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_ADD: begin
+                    // Element-wise addition
+                    add_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_LAYERNORM: begin
+                    layernorm_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_TRANSPOSE: begin
+                    // Transpose matrix in buffer
+                    transpose_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_SCALE: begin
+                    // Scale by constant (src2 = scale factor)
+                    scale_start <= 1'b1;
+                    is_compute_op <= 1'b1;
+                end
+
+                OP_SYNC: begin
+                    // Wait for all pending operations
+                    sync_wait <= 1'b1;
+                    is_control_op <= 1'b1;
+                end
+
+                OP_LOOP: begin
+                    // Loop control
+                    // dst[3:0] = loop index (0-2 for M, N, K)
+                    // src1 = loop count
+                    // src2 = target PC for loop start
+                    loop_start <= 1'b1;
+                    is_control_op <= 1'b1;
+                end
+
+                OP_HALT: begin
+                    // Stop execution
+                    halt <= 1'b1;
+                    is_control_op <= 1'b1;
+                end
+
+                default: begin
+                    // Unknown opcode - treat as NOP
+                    is_control_op <= 1'b1;
+                end
+            endcase
         end
-    
-
-
-
-
-
-    
     end
     endmodule
+
+module instruction_builder (
+    input wire [7:0]    opcode,
+    input wire [3:0]    flags,
+    input wire [3:0]    dst,
+    input wire [7:0]    src1,
+    input wire [7:0]    src2,
+    output wire [31:0]  instruction
+)
+    assign instruction = {opcode, flags, dst, src1, src2};
+endmodule

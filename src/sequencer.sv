@@ -1,18 +1,24 @@
-//FSM for the whole system
-
-//IDLE->wait for start
-//fetch->fetch instruction from mem
-//decoder->for instruction and get important signals
-//load_setup->load weights, activation from mem
-//load_wait->
-//execut->start the comput
-//exec_wait->
-//store_setup->store results to mem
-//store_wait->
-//sync->wait for all operations
-//update->update PC and loop counter
-//done
-
+// =========================================================================
+// TPU SEQUENCER (MASTER CONTROLLER)
+// =========================================================================
+// > The central "Brain" of the TPU execution pipeline.
+// > Orchestrates instruction fetching, decoding, data loading, computation,
+//   and storing results back to memory.
+//
+// FSM Execution Flow:
+//   IDLE         -> Waiting for the start signal
+//   FETCH        -> Grab the next 32-bit instruction from instruction memory
+//   DECODE       -> Parse instruction to determine operation type and signals
+//   LOAD_SETUP   -> Initiate weight/activation load from Unified Buffer
+//   LOAD_WAIT    -> Waiting for load operation to complete
+//   EXECUTE      -> Trigger functional units (Systolic Array, Activation Unit)
+//   EXEC_WAIT    -> Waiting for computation to finish
+//   STORE_SETUP  -> Initiate storing output results to Unified Buffer
+//   STORE_WAIT   -> Waiting for store operation to complete
+//   SYNC         -> Halt and wait for all executing operations to synchronize
+//   UPDATE       -> Increment Program Counter (PC) or branch if looping
+//   DONE_STATE   -> Program finished execution
+// =========================================================================
 module sequencer (
     input wire                  start,              // Start execution
     input wire                  stop,               // Stop execution
@@ -75,7 +81,7 @@ module sequencer (
     localparam STORE_WAIT = 4'b1000;
     localparam SYNC = 4'b1001;
     localparam UPDATE = 4'b1010;
-    localparam DONE = 4'b1011;
+    localparam DONE_STATE = 4'b1011;
 
     localparam FETCHER_IDLE = 3'b000;
     localparam FETCHER_FETCHED = 3'b011;
@@ -116,7 +122,11 @@ module sequencer (
 
             end
 
-            case (state) begin
+            case (state)
+                // -----------------------------------------------------------------
+                // STATE 0: IDLE
+                // > Wait for the host to send the 'start' signal to begin execution
+                // -----------------------------------------------------------------
                 IDLE: begin
                     done <= 1'b0;
                     cycle_count <= 32'b0;
@@ -126,72 +136,89 @@ module sequencer (
                         fetch_enable <= 1'b1;
                         state <= FETCH;
                     end
-                
                 end
+                // -----------------------------------------------------------------
+                // STATE 1: FETCH
+                // > Pulse fetch_enable and wait until Fetcher returns a valid instruction
+                // -----------------------------------------------------------------
                 FETCH: begin
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
+                        state <= DONE_STATE;
                     end else if (instruction_valid || fetcher_state == FETCHER_FETCHED) begin
-                        decode_enable <= 1'b1;
+                        decode_enable <= 1'b1; // Trigger the Decoder
                         state <= DECODE;
                     end else begin
-                        fetch_enable <= 1'b1;
+                        fetch_enable <= 1'b1; // Keep asking for instruction
                     end
                 end
 
+                // -----------------------------------------------------------------
+                // STATE 2: DECODE
+                // > Route the execution based on what the Decoder found
+                // -----------------------------------------------------------------
                 DECODE: begin
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
+                        state <= DONE_STATE;
                     end else begin
+                        // Save the instruction categorization for the current run
                         instruction_type_memory <= is_memory_op;
                         instruction_type_compute <= is_compute_op;
                         instruction_type_control <= is_control_op;
 
+                        // Priority-based state transitions
                         if (halt_decoded) begin
                             running <= 1'b0;
-                            state <= DONE;
+                            state <= DONE_STATE;
                         end else if (sync_decoded) begin
                             state <= SYNC;
                         end else if (loop_decoded) begin
                             state <= UPDATE;
-                        end else if (is_memory_op) begin //load or store
+                        end else if (is_memory_op) begin // LOAD_W, LOAD_A, STORE
                             state <= LOAD_SETUP;
-                        end else if (is_compute_op) begin //matmul, activation
+                        end else if (is_compute_op) begin // MATMUL, ACT_*
                             state <= EXECUTE;
-                        end else begin //NOP or unknown
-                            state <= Update;
+                        end else begin // NOP or Unknown
+                            state <= UPDATE;
                         end
                     end
                 end
 
+                // -----------------------------------------------------------------
+                // STATE 3 & 4: LOAD OPERATIONS
+                // > LOAD_SETUP initiates. LOAD_WAIT monitors bus status continuously.
+                // -----------------------------------------------------------------
                 LOAD_SETUP: begin
-                    state <= LOAD_WAIT; //mem load and store happens in one cycle. decoder also set signals
+                    state <= LOAD_WAIT; // Memory requests happen over 1 cycle; Decoder sets signals
                 end
 
                 LOAD_WAIT: begin
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
-                    end else if (!load_busy && !store_busy) begin
+                        state <= DONE_STATE;
+                    end else if (!load_busy && !store_busy) begin // Wait until Memory bus is idle
                         if (load_done || store_done) begin
                             state <= UPDATE;
                         end
                     end
                 end
 
-                EXECUTION: begin
+                // -----------------------------------------------------------------
+                // STATE 5 & 6: EXECUTE COMPUTE BLOCKS
+                // > EXECUTE initiates. EXEC_WAIT waits for Math logic to finish.
+                // -----------------------------------------------------------------
+                EXECUTE: begin
                     state <= EXEC_WAIT;
                 end
 
                 EXEC_WAIT: begin
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
+                        state <= DONE_STATE;
                     end else if (!compute_busy && !matmul_busy) begin
                         if (matmul_decoded) begin
-                            //matmul done, need to store
+                            // Matmul done, route automatically to STORE setup
                             state <= STORE_SETUP;
                         end else begin
                             state <= UPDATE;
@@ -199,6 +226,10 @@ module sequencer (
                     end
                 end
 
+                // -----------------------------------------------------------------
+                // STATE 7 & 8: STORE OPERATIONS
+                // > Setup to store results into the unified memory
+                // -----------------------------------------------------------------
                 STORE_SETUP: begin
                     state <= STORE_WAIT;
                 end
@@ -206,38 +237,49 @@ module sequencer (
                 STORE_WAIT: begin
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
-                    end else if (!store_begin) begin
+                        state <= DONE_STATE;
+                    end else if (!store_busy) begin
                         state <= UPDATE;
                     end
                 end
 
+                // -----------------------------------------------------------------
+                // STATE 9: SYNC
+                // > Pause until everything finishes (Barrier synchronization)
+                // -----------------------------------------------------------------
                 SYNC: begin
-                    //wait for all operations to finish
                     if (stop) begin
                         running <= 1'b0;
-                        state <= DONE;
+                        state <= DONE_STATE;
                     end else if (!load_busy && !store_busy && !compute_busy && !matmul_busy) begin
                         state <= UPDATE;
                     end
                 end
 
+                // -----------------------------------------------------------------
+                // STATE 10: UPDATE LOGIC
+                // > Determine where to point the PC next (Increment or Loop branch)
+                // -----------------------------------------------------------------
                 UPDATE: begin
-                    //update PC and check for loops
-                    if (loop_active && loop_itertation_done) begin
-                        //loop back
+                    if (loop_active && loop_iteration_done) begin
+                        // Need another loop iteration, so branch backward
                         pc_branch <= 1'b1;
                         pc_branch_target <= loop_target_pc;
                     end
-                    //next instruction
+                    // Trigger fetch for the upcoming instruction cycle
                     fetch_enable <= 1'b1;
                     state <= FETCH;
                 end
 
-                DONE: begin
+                // -----------------------------------------------------------------
+                // STATE 11: DONE
+                // > Raise the done flag and halt execution loop
+                // -----------------------------------------------------------------
+                DONE_STATE: begin
                     done <= 1'b1;
                     running <= 1'b0;
 
+                    // Allows host to restart directly from the DONE_STATE
                     if (start && !stop) begin
                         done <= 1'b0;
                         running <= 1'b1;
@@ -251,7 +293,6 @@ module sequencer (
                     state <= IDLE;
                 end
 
-            end
             endcase
         end
     end

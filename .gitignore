@@ -1,3 +1,5 @@
 tiny-tpu/
 GEMINI.md
 .gemini/
+.claude/
+.codex/
